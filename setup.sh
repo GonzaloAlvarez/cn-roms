@@ -41,6 +41,18 @@ if ! mountpoint -q "$NFS_MOUNTPOINT"; then
 fi
 echo "[2/6] NFS mounted: $(mount | grep raidnas | head -1)"
 
+# ── 2b. seed empty config.yml so RomM doesn't log "Config file not found!" ──
+# RomM's config_manager opens /romm/config/config.yml on init and logs a
+# critical warning if missing. The file is optional (custom platform
+# definitions etc.) and an empty file is a valid YAML doc → defaults apply.
+mkdir -p "$REPO_DIR/config"
+if [ ! -f "$REPO_DIR/config/config.yml" ]; then
+  echo "[2b/6] seeding empty $REPO_DIR/config/config.yml"
+  : > "$REPO_DIR/config/config.yml"
+else
+  echo "[2b/6] config/config.yml already present"
+fi
+
 # ── 3. roms subtree sanity ───────────────────────────────────────────────
 if [ ! -d "$ROMS_SUBTREE" ]; then
   echo "ERROR: $ROMS_SUBTREE missing — create it on raidnas first:" >&2

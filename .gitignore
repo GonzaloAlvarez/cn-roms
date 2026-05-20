@@ -5,3 +5,7 @@
 # step-ca root CA blob (copied by setup.sh)
 /certs/*.crt
 !/certs/.gitkeep
+
+# RomM runtime config (bind-mounted into the container; seeded by setup.sh
+# and updated by RomM itself when the user edits it via the UI).
+/config/

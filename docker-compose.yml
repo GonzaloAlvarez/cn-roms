@@ -108,7 +108,12 @@ services:
       - /home/gonzalo/docker/data/nfs/roms/assets:/romm/assets
       - romm_resources:/romm/resources
       - romm_redis_data:/redis-data
-      - romm_config:/romm/config
+      # Bind mount (not a named volume) so setup.sh can seed an empty
+      # config.yml before the container starts — RomM logs a critical
+      # "Config file not found!" warning otherwise (it tries to open
+      # /romm/config/config.yml on init and bails with FileNotFoundError).
+      # Bonus: you can edit ./config/config.yml directly on kaiser.
+      - ./config:/romm/config
     depends_on:
       ts-roms:
         condition: service_healthy
@@ -250,4 +255,3 @@ volumes:
   romm_db:
   romm_resources:
   romm_redis_data:
-  romm_config:
