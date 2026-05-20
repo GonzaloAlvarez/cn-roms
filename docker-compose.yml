@@ -1,0 +1,249 @@
+services:
+  # ── NFS preflight: bail early if /home/gonzalo/docker/data/nfs isn't up ──
+  mount-precheck:
+    image: alpine:3.20
+    command:
+      - /bin/sh
+      - -c
+      - |
+        set -e
+        mountpoint -q /nfs-check || { echo "FAIL: NFS not mounted at /home/gonzalo/docker/data/nfs"; exit 1; }
+        test -d /nfs-check/roms/library/roms || { echo "FAIL: /roms/library/roms subtree missing on NFS (mkdir on raidnas first)"; exit 1; }
+        echo "NFS OK ($$(df -h /nfs-check | tail -1 | awk '{print $$4}') free)"
+    volumes:
+      - /home/gonzalo/docker/data/nfs:/nfs-check:ro
+    restart: "no"
+
+  # ── Tailscale sidecar: owns the netns shared by romm + observability ──
+  ts-roms:
+    image: tailscale/tailscale:latest
+    hostname: ts-roms
+    cap_add: [NET_ADMIN, SYS_MODULE]
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    sysctls:
+      - net.ipv4.conf.all.src_valid_mark=1
+    volumes:
+      - ts_state:/var/lib/tailscale
+      - ./certs/root_ca.crt:/staging-certs/root_ca.crt:ro
+      - /lib/modules:/lib/modules:ro
+    environment:
+      - TS_STATE_DIR=/var/lib/tailscale
+      - TS_AUTHKEY=${ROMS_AUTHKEY}
+      - TS_HOSTNAME=roms
+      - TS_ACCEPT_DNS=true
+      - TS_AUTH_ONCE=true
+      - TS_USERSPACE=false
+      - TS_TAILSCALED_EXTRA_ARGS=--tun=tailscale0
+      - TS_EXTRA_ARGS=--login-server=https://${HEADSCALE_DOMAIN}
+      - SSL_CERT_DIR=/staging-certs
+    ports:
+      - "127.0.0.1:8080:8080"
+    depends_on:
+      mount-precheck:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "tailscale ip --4 >/dev/null 2>&1"]
+      interval: 10s
+      retries: 30
+      start_period: 30s
+    restart: unless-stopped
+
+  # ── MariaDB: RomM's metadata store. Runs on the project bridge with a
+  # pinned IP. We cannot use the container name (`romm-db`) from the romm
+  # service because that container shares ts-roms's netns and tailscaled
+  # overwrites /etc/resolv.conf to MagicDNS (see cn-root-docker
+  # prometheus.yml:50-53 — same constraint hit by the headscale scrape).
+  # `extra_hosts` doesn't work on network_mode:service:X either.
+  romm-db:
+    image: mariadb:11.4
+    networks:
+      default:
+        ipv4_address: 172.30.0.10
+    environment:
+      - MARIADB_DATABASE=romm
+      - MARIADB_USER=romm
+      - MARIADB_PASSWORD=${DB_PASSWORD}
+      - MARIADB_ROOT_PASSWORD=${DB_ROOT_PASSWORD}
+    volumes:
+      - romm_db:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mariadb-admin ping -h 127.0.0.1 -uroot -p$$MARIADB_ROOT_PASSWORD"]
+      interval: 10s
+      retries: 30
+      start_period: 30s
+    restart: unless-stopped
+
+  # ── RomM: ROM library manager web UI + REST API. Shares ts-roms's netns.
+  # `redis-data` named volume holds the bundled Redis (RomM ships Redis
+  # inside the image; no separate service required upstream).
+  # /romm/library and /romm/assets live on raidnas NFS so the appliance
+  # keeps giving the ROM corpus RAID redundancy.
+  # /romm/resources (IGDB image cache) and /romm/config stay on local
+  # named volumes — small, performance-sensitive, regenerable.
+  romm:
+    image: rommapp/romm:latest
+    network_mode: "service:ts-roms"
+    environment:
+      - DB_HOST=172.30.0.10
+      - DB_PORT=3306
+      - DB_NAME=romm
+      - DB_USER=romm
+      - DB_PASSWD=${DB_PASSWORD}
+      - ROMM_AUTH_SECRET_KEY=${ROMM_SECRET}
+      - HASHEOUS_API_ENABLED=true
+      - IGDB_CLIENT_ID=${IGDB_CLIENT_ID:-}
+      - IGDB_CLIENT_SECRET=${IGDB_CLIENT_SECRET:-}
+      - SCREENSCRAPER_USER=${SCREENSCRAPER_USER:-}
+      - SCREENSCRAPER_PASSWORD=${SCREENSCRAPER_PASSWORD:-}
+      - RETROACHIEVEMENTS_API_KEY=${RETROACHIEVEMENTS_API_KEY:-}
+      - STEAMGRIDDB_API_KEY=${STEAMGRIDDB_API_KEY:-}
+      - TZ=${TIMEZONE}
+    volumes:
+      - /home/gonzalo/docker/data/nfs/roms/library:/romm/library
+      - /home/gonzalo/docker/data/nfs/roms/assets:/romm/assets
+      - romm_resources:/romm/resources
+      - romm_redis_data:/redis-data
+      - romm_config:/romm/config
+    depends_on:
+      ts-roms:
+        condition: service_healthy
+      romm-db:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── Consul self-registration: makes roms.lab.gn.al routable via traefik-lab ──
+  consul-register:
+    image: curlimages/curl:8.8.0
+    network_mode: "service:ts-roms"
+    environment:
+      - CONSUL_ADDR=http://${INFRA_VPS_TAILNET_IP}:8500
+      - TAILNET_HOST=roms.${TAILNET_DOMAIN}
+      - LAB_DOMAIN=${LAB_DOMAIN}
+    command:
+      - /bin/sh
+      - -c
+      - |
+        set -eu
+        register() {
+          NAME=$$1; PORT=$$2; SUB=$$3
+          PAYLOAD=$$(cat <<JSON
+        {
+          "Name": "$$NAME",
+          "ID": "$$NAME-roms",
+          "Address": "$$TAILNET_HOST",
+          "Port": $$PORT,
+          "Tags": [
+            "traefik.enable=true",
+            "traefik.http.routers.$$NAME.rule=Host(\`$$SUB.$$LAB_DOMAIN\`)",
+            "traefik.http.routers.$$NAME.entrypoints=websecure",
+            "traefik.http.routers.$$NAME.tls=true",
+            "traefik.http.routers.$$NAME.tls.certresolver=dns"
+          ],
+          "Check": {
+            "TCP": "$$TAILNET_HOST:$$PORT",
+            "Interval": "10s",
+            "DeregisterCriticalServiceAfter": "2m"
+          }
+        }
+        JSON
+          )
+          curl -sf -X PUT "$$CONSUL_ADDR/v1/agent/service/register" \
+               -H "Content-Type: application/json" -d "$$PAYLOAD" >/dev/null \
+            && echo "registered $$NAME ($$SUB.$$LAB_DOMAIN -> :$$PORT)" \
+            || echo "FAILED to register $$NAME" >&2
+        }
+        while true; do
+          register romm 8080 roms
+          sleep 60
+        done
+    depends_on:
+      ts-roms:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── promtail: ship container logs to VPS Loki ──
+  promtail:
+    image: grafana/promtail:3.4.2
+    network_mode: "service:ts-roms"
+    command: ["-config.file=/etc/promtail/promtail.yml", "-config.expand-env=true"]
+    volumes:
+      - ./promtail/promtail.yml:/etc/promtail/promtail.yml:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    environment:
+      - INFRA_VPS_TAILNET_IP=${INFRA_VPS_TAILNET_IP}
+    depends_on:
+      ts-roms:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── node-exporter: stack-level metrics into VPS Prometheus ──
+  node-exporter:
+    image: prom/node-exporter:latest
+    network_mode: "service:ts-roms"
+    command:
+      - "--path.procfs=/host/proc"
+      - "--path.sysfs=/host/sys"
+      - "--path.rootfs=/rootfs"
+      - "--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)"
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+    depends_on:
+      ts-roms:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── ts-roms watchdog: force-recreate dependents on netns drift ──
+  ts-roms-watchdog:
+    image: docker:cli
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${PWD}:${PWD}
+    working_dir: ${PWD}
+    command:
+      - /bin/sh
+      - -c
+      - |
+        apk add --no-cache docker-cli-compose >/dev/null
+        echo "[watchdog] ready, polling ts-roms every 10s"
+        LAST=""
+        while true; do
+          CUR=$$(docker inspect cn-roms-ts-roms-1 --format "{{.State.StartedAt}}" 2>/dev/null || true)
+          if [ -n "$$CUR" ] && [ -n "$$LAST" ] && [ "$$CUR" != "$$LAST" ]; then
+            echo "[watchdog] ts-roms restarted (was $$LAST, now $$CUR), recreating dependents"
+            docker compose -p cn-roms up -d --force-recreate --no-deps \
+              romm consul-register promtail node-exporter \
+              && echo "[watchdog] OK" \
+              || echo "[watchdog] FAILED"
+          fi
+          LAST="$$CUR"
+          sleep 10
+        done
+    restart: unless-stopped
+
+  watchtower:
+    image: containrrr/watchtower:latest
+    command:
+      - "--cleanup"
+      - "--schedule=0 0 5 * * *"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - DOCKER_API_VERSION=1.45
+    restart: unless-stopped
+
+networks:
+  default:
+    ipam:
+      driver: default
+      config:
+        - subnet: 172.30.0.0/24
+
+volumes:
+  ts_state:
+  romm_db:
+  romm_resources:
+  romm_redis_data:
+  romm_config:

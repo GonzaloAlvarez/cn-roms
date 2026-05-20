@@ -1,0 +1,7 @@
+.env
+*.log
+*.bak
+
+# step-ca root CA blob (copied by setup.sh)
+/certs/*.crt
+!/certs/.gitkeep
