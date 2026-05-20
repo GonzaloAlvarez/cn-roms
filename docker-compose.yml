@@ -38,7 +38,11 @@ services:
       - TS_EXTRA_ARGS=--login-server=https://${HEADSCALE_DOMAIN}
       - SSL_CERT_DIR=/staging-certs
     ports:
-      - "127.0.0.1:8080:8080"
+      # Host port 8083 (not 8080 — cn-bittorrent's qbittorrent already
+      # owns 127.0.0.1:8080 on this host). Container/sidecar port stays
+      # 8080 because that's where RomM listens inside the netns; consul-
+      # register also advertises 8080 to traefik-lab over the tailnet.
+      - "127.0.0.1:8083:8080"
     depends_on:
       mount-precheck:
         condition: service_completed_successfully
