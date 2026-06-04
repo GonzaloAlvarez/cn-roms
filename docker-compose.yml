@@ -205,6 +205,12 @@ services:
     restart: unless-stopped
 
   # ── ts-roms watchdog: force-recreate dependents on netns drift ──
+  # Detects drift by comparing each dependent's HostConfig.NetworkMode
+  # ("container:<id>") against ts-roms's current container ID. Self-heals
+  # on its own first poll (so a coordinated stack restart, e.g. watchtower,
+  # cannot leave dependents pinned to an orphaned netns inode), silently
+  # no-ops in steady state. Also restarts dependents stuck in non-running
+  # status (e.g. Created-but-never-started after a midway compose failure).
   ts-roms-watchdog:
     image: docker:cli
     volumes:
@@ -216,18 +222,36 @@ services:
       - -c
       - |
         apk add --no-cache docker-cli-compose >/dev/null
-        echo "[watchdog] ready, polling ts-roms every 10s"
-        LAST=""
+        DEPS="romm consul-register promtail node-exporter"
+        echo "[watchdog] ready, polling dependents every 10s ($$DEPS)"
         while true; do
-          CUR=$$(docker inspect cn-roms-ts-roms-1 --format "{{.State.StartedAt}}" 2>/dev/null || true)
-          if [ -n "$$CUR" ] && [ -n "$$LAST" ] && [ "$$CUR" != "$$LAST" ]; then
-            echo "[watchdog] ts-roms restarted (was $$LAST, now $$CUR), recreating dependents"
-            docker compose -p cn-roms up -d --force-recreate --no-deps \
-              romm consul-register promtail node-exporter \
-              && echo "[watchdog] OK" \
-              || echo "[watchdog] FAILED"
+          TS_ID=$$(docker inspect cn-roms-ts-roms-1 --format "{{.Id}}" 2>/dev/null || true)
+          if [ -n "$$TS_ID" ]; then
+            NEED_RECREATE=""
+            NEED_START=""
+            for dep in $$DEPS; do
+              INFO=$$(docker inspect cn-roms-$$dep-1 --format "{{.HostConfig.NetworkMode}} {{.State.Status}}" 2>/dev/null || true)
+              [ -n "$$INFO" ] || continue
+              DEP_NM=$$(echo "$$INFO" | awk "{print \$$1}")
+              DEP_STATUS=$$(echo "$$INFO" | awk "{print \$$2}")
+              DEP_TARGET=$${DEP_NM#container:}
+              if [ "$$DEP_TARGET" != "$$TS_ID" ]; then
+                NEED_RECREATE="$$NEED_RECREATE $$dep"
+              elif [ "$$DEP_STATUS" != "running" ]; then
+                NEED_START="$$NEED_START $$dep"
+              fi
+            done
+            if [ -n "$$NEED_RECREATE" ]; then
+              echo "[watchdog] netns drift on:$$NEED_RECREATE -- recreating"
+              docker compose -p cn-roms up -d --force-recreate --no-deps $$NEED_RECREATE \
+                && echo "[watchdog] recreate OK" || echo "[watchdog] recreate FAILED"
+            fi
+            if [ -n "$$NEED_START" ]; then
+              echo "[watchdog] stopped on:$$NEED_START -- starting"
+              docker compose -p cn-roms start $$NEED_START \
+                && echo "[watchdog] start OK" || echo "[watchdog] start FAILED"
+            fi
           fi
-          LAST="$$CUR"
           sleep 10
         done
     restart: unless-stopped
