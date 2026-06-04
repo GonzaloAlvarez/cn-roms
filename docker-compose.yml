@@ -207,10 +207,14 @@ services:
   # ── ts-roms watchdog: force-recreate dependents on netns drift ──
   # Detects drift by comparing each dependent's HostConfig.NetworkMode
   # ("container:<id>") against ts-roms's current container ID. Self-heals
-  # on its own first poll (so a coordinated stack restart, e.g. watchtower,
-  # cannot leave dependents pinned to an orphaned netns inode), silently
-  # no-ops in steady state. Also restarts dependents stuck in non-running
-  # status (e.g. Created-but-never-started after a midway compose failure).
+  # on its own first poll, silently no-ops in steady state. Also restarts
+  # dependents stuck in non-running status (e.g. Created-but-never-started
+  # after a midway compose failure).
+  # The drift threshold (3 polls = 30s) prevents the watchdog from racing
+  # systemd's own `docker compose up` during a stack-wide recreate: a
+  # legitimate compose-up resettles dependents in <30s, so transient drift
+  # is ignored; real netns drift after a tailscaled crash persists, so the
+  # watchdog still fires within ~30s.
   ts-roms-watchdog:
     image: docker:cli
     volumes:
@@ -223,7 +227,9 @@ services:
       - |
         apk add --no-cache docker-cli-compose >/dev/null
         DEPS="romm consul-register promtail node-exporter"
-        echo "[watchdog] ready, polling dependents every 10s ($$DEPS)"
+        ACTION_THRESHOLD=3
+        ACTION_COUNT=0
+        echo "[watchdog] ready, polling dependents every 10s ($$DEPS), drift threshold $$ACTION_THRESHOLD polls"
         while true; do
           TS_ID=$$(docker inspect cn-roms-ts-roms-1 --format "{{.Id}}" 2>/dev/null || true)
           if [ -n "$$TS_ID" ]; then
@@ -241,15 +247,25 @@ services:
                 NEED_START="$$NEED_START $$dep"
               fi
             done
-            if [ -n "$$NEED_RECREATE" ]; then
-              echo "[watchdog] netns drift on:$$NEED_RECREATE -- recreating"
-              docker compose -p cn-roms up -d --force-recreate --no-deps $$NEED_RECREATE \
-                && echo "[watchdog] recreate OK" || echo "[watchdog] recreate FAILED"
-            fi
-            if [ -n "$$NEED_START" ]; then
-              echo "[watchdog] stopped on:$$NEED_START -- starting"
-              docker compose -p cn-roms start $$NEED_START \
-                && echo "[watchdog] start OK" || echo "[watchdog] start FAILED"
+            if [ -n "$$NEED_RECREATE" ] || [ -n "$$NEED_START" ]; then
+              ACTION_COUNT=$$((ACTION_COUNT + 1))
+              if [ "$$ACTION_COUNT" -ge "$$ACTION_THRESHOLD" ]; then
+                if [ -n "$$NEED_RECREATE" ]; then
+                  echo "[watchdog] persistent drift on:$$NEED_RECREATE -- recreating"
+                  docker compose -p cn-roms up -d --force-recreate --no-deps $$NEED_RECREATE \
+                    && echo "[watchdog] recreate OK" || echo "[watchdog] recreate FAILED"
+                fi
+                if [ -n "$$NEED_START" ]; then
+                  echo "[watchdog] persistent stopped on:$$NEED_START -- starting"
+                  docker compose -p cn-roms start $$NEED_START \
+                    && echo "[watchdog] start OK" || echo "[watchdog] start FAILED"
+                fi
+                ACTION_COUNT=0
+              else
+                echo "[watchdog] action pending (drift:$$NEED_RECREATE start:$$NEED_START count=$$ACTION_COUNT/$$ACTION_THRESHOLD)"
+              fi
+            else
+              ACTION_COUNT=0
             fi
           fi
           sleep 10
