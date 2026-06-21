@@ -86,8 +86,16 @@ services:
   # /romm/resources (IGDB image cache) and /romm/config stay on local
   # named volumes — small, performance-sensitive, regenerable.
   romm:
-    image: rommapp/romm:latest
+    # Image pinned to the digest under which Authentik forward-auth + RomM's
+    # HybridAuthBackend (Authorization: Basic) was validated. The auth path
+    # depends on /backend/handler/auth/hybrid_auth.py honoring Basic creds —
+    # an upstream refactor could silently break it. Pair with the watchtower
+    # exclusion label below (belt + suspenders). To upgrade: bump the digest
+    # explicitly after re-verifying the Basic flow against the new image.
+    image: rommapp/romm:latest@sha256:0ec219d3cf24a9ee76f36c318ec03fca842d474b9ba47a6484e40b62b11983dc
     network_mode: "service:ts-roms"
+    labels:
+      - "com.centurylinklabs.watchtower.enable=false"
     environment:
       - DB_HOST=172.30.0.10
       - DB_PORT=3306
@@ -147,7 +155,8 @@ services:
             "traefik.http.routers.$$NAME.rule=Host(\`$$SUB.$$LAB_DOMAIN\`)",
             "traefik.http.routers.$$NAME.entrypoints=websecure",
             "traefik.http.routers.$$NAME.tls=true",
-            "traefik.http.routers.$$NAME.tls.certresolver=dns"
+            "traefik.http.routers.$$NAME.tls.certresolver=dns",
+            "traefik.http.routers.$$NAME.middlewares=authentik-lab@file"
           ],
           "Check": {
             "TCP": "$$TAILNET_HOST:$$PORT",

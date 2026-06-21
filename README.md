@@ -86,6 +86,41 @@ through a web wizard. Open `https://roms.kaiser.lan/` (LAN) or
 `https://roms.lab.gn.al/` (tailnet) and complete the setup. The first account
 is automatically admin.
 
+### 6b. Authentik SSO via Traefik forward-auth
+
+Both ingresses are gated by Authentik via Traefik's `forwardAuth` middleware
+(`authentik-lan` on cn-home, `authentik-lab` on cn-root-docker tailnet). RomM
+itself has **no OIDC integration** — Authentik's embedded outpost injects an
+`Authorization: Basic <b64(user:pass)>` header on every authenticated request,
+which RomM's `HybridAuthBackend` validates against its own user DB
+(`/backend/handler/auth/hybrid_auth.py:30-46`).
+
+Trade-off the operator has explicitly accepted: every Authentik user who's
+in the `media` or `infra-admins` group lands in RomM as the **same** shared
+user. RomM's user model becomes vestigial — one bootstrap admin is enough.
+
+To wire it up:
+
+```sh
+# On neptune.lan (Authentik host):
+cd ~/cn-authentik
+ROMM_SSO_USERNAME=<your romm user> \
+ROMM_SSO_PASSWORD=<your romm password> \
+  ./setup-romm-proxy-sso.sh
+```
+
+This creates two Authentik proxy providers (`roms-lan` with
+`external_host=https://roms.kaiser.lan`, `roms-lab` with `https://roms.lab.gn.al`),
+two applications, four group→app bindings, and writes `romm_username` +
+`romm_password` to the `media` and `infra-admins` group attributes. Re-run
+any time to rotate credentials (PATCH-merge, idempotent).
+
+**Rollback**: comment the `- authentik-lan` line on the `roms` router in
+`cn-home/traefik-lan/dynamic.yml.tmpl`, drop the `middlewares=authentik-lab@file`
+tag from cn-roms's `consul-register` block, force-recreate traefik-lan and
+consul-register. RomM falls back to its native login page; the bootstrap
+admin still works.
+
 ### 7. Argosy on Android
 
 1. Install Tailscale from Google Play; sign in via the headscale flow
@@ -147,4 +182,7 @@ the same way (pin the IP). Subnet 172.30.0.0/24 declared explicitly under
   ([backend/main.py](https://github.com/rommapp/romm/blob/master/backend/main.py)).
   Use blackbox_exporter probe of `/api/heartbeat` or watch for a community
   exporter.
-- **Image tag pin.** v1 uses `:latest`. Pin to a major (`:4`) once stable.
+- **Image tag pin.** v1 used `:latest` unpinned. Now pinned to a specific
+  digest as part of the Authentik forward-auth integration (the auth model
+  depends on a stable `HybridAuthBackend`). Bump explicitly after re-verifying
+  the Basic-auth path against the new image.
