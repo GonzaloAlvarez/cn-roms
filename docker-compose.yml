@@ -92,7 +92,7 @@ services:
     # an upstream refactor could silently break it. Pair with the watchtower
     # exclusion label below (belt + suspenders). To upgrade: bump the digest
     # explicitly after re-verifying the Basic flow against the new image.
-    image: rommapp/romm:latest@sha256:0ec219d3cf24a9ee76f36c318ec03fca842d474b9ba47a6484e40b62b11983dc
+    image: rommapp/romm@sha256:c81778afcafe7c865bdf156d1c62349aec3dfca3aca5ec0d6c2c2e8bfa9fb071
     network_mode: "service:ts-roms"
     labels:
       - "com.centurylinklabs.watchtower.enable=false"
