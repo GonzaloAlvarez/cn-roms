@@ -8,6 +8,10 @@ services:
       - |
         set -e
         mountpoint -q /nfs-check || { echo "FAIL: NFS not mounted at /home/gonzalo/docker/data/nfs"; exit 1; }
+        # Assert it's REALLY the NFS share, not the empty local placeholder a
+        # failed mount leaves behind (which satisfies the dir check below and
+        # leaves RomM with an empty library — happened 2026-06-22).
+        test "$$(stat -f -c %T /nfs-check)" = nfs || { echo "FAIL: /nfs-check is not nfs ($$(stat -f -c %T /nfs-check)) — refusing to start on placeholder"; exit 1; }
         test -d /nfs-check/roms/library/roms || { echo "FAIL: /roms/library/roms subtree missing on NFS (mkdir on raidnas first)"; exit 1; }
         echo "NFS OK ($$(df -h /nfs-check | tail -1 | awk '{print $$4}') free)"
     volumes:
