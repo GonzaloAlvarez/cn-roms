@@ -15,12 +15,11 @@ Dual-ingress, like `cn-media`'s jellyfin.
 | `mount-precheck` | Bails if `/home/gonzalo/docker/data/nfs/roms/library/roms` isn't there. |
 | `ts-roms` | Tailscale sidecar; owns the netns. Hostname `roms` (MagicDNS → `roms.ts.gn.al`). `tag:svc`. |
 | `romm-db` | MariaDB 11.4. Runs on the project bridge at fixed IP `172.30.0.10` (DNS doesn't work into ts-roms's netns — see comment in `docker-compose.yml`). |
-| `romm` | `rommapp/romm:latest`. `network_mode: service:ts-roms`. `/romm/library` + `/romm/assets` on raidnas NFS; `/romm/resources` + `/romm/config` + bundled Redis on local named volumes. |
+| `romm` | `rommapp/romm:5.3.1` (explicit tag, watchtower-excluded — see *Upgrading*). `network_mode: service:ts-roms`. `/romm/library` + `/romm/assets` on raidnas NFS; `/romm/resources` + `/romm/config` + bundled Redis on local named volumes. |
 | `consul-register` | Self-registers `roms` with VPS Consul every 60 s so traefik-lab picks up the route. |
 | `promtail` | Ships container logs to VPS Loki at `${INFRA_VPS_TAILNET_IP}:3100`. |
 | `node-exporter` | Stack metrics for VPS Prometheus. |
 | `ts-roms-watchdog` | Force-recreates dependents when ts-roms restarts (netns drift fix). |
-| `watchtower` | Daily image update at 05:00 UTC with `--cleanup`. |
 
 ## First-time setup
 
@@ -174,6 +173,28 @@ prometheus.yml hit the same constraint with the headscale scrape and solved it
 the same way (pin the IP). Subnet 172.30.0.0/24 declared explicitly under
 `networks.default.ipam.config` so the assignment is stable.
 
+## Upgrading
+
+`romm` is on an explicit tag and excluded from kaiser's host-wide watchtower
+(`com.centurylinklabs.watchtower.enable=false`) on purpose: RomM minors have
+shipped config-affecting changes (5.3.0: `filesystem.structure` in
+`config.yml`, content-hash ROM identity). Alembic migrations are one-way, so:
+
+1. Dump the DB first (the only rollback):
+   ```sh
+   docker exec cn-roms-romm-db-1 sh -c 'mariadb-dump -uroot -p"$MARIADB_ROOT_PASSWORD" \
+     --single-transaction --routines --triggers romm' | gzip > ~/romm-db-$(date +%F).sql.gz
+   ```
+2. Read the release notes between the current and target tag; re-check
+   `config/config.yml` against `config/config.yml.example`.
+3. Bump `image:` in `docker-compose.yml`, commit, push; on kaiser
+   `git pull && ./setup.sh && sudo systemctl restart docker-compose@cn-roms.service`
+   and watch `docker logs -f cn-roms-romm-1` until migrations finish.
+4. Kick a library scan off-hours if the release changed ROM identity/hashing.
+
+Rollback: revert the commit, `docker compose -p cn-roms stop romm`, drop +
+recreate the `romm` database, import the dump, restart the unit.
+
 ## Deferred
 
 - **DB backup.** Add `offen/docker-volume-backup` mirroring `cn-vaultwarden`'s
@@ -182,7 +203,5 @@ the same way (pin the IP). Subnet 172.30.0.0/24 declared explicitly under
   ([backend/main.py](https://github.com/rommapp/romm/blob/master/backend/main.py)).
   Use blackbox_exporter probe of `/api/heartbeat` or watch for a community
   exporter.
-- **Image tag pin.** v1 used `:latest` unpinned. Now pinned to a specific
-  digest as part of the Authentik forward-auth integration (the auth model
-  depends on a stable `HybridAuthBackend`). Bump explicitly after re-verifying
-  the Basic-auth path against the new image.
+- **DB backup automation.** A manual `mariadb-dump` recipe lives under
+  *Upgrading*; automate it (offen) if RomM state keeps growing.

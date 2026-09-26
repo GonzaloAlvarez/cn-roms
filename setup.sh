@@ -41,16 +41,19 @@ if ! mountpoint -q "$NFS_MOUNTPOINT"; then
 fi
 echo "[2/6] NFS mounted: $(mount | grep raidnas | head -1)"
 
-# ── 2b. seed empty config.yml so RomM doesn't log "Config file not found!" ──
-# RomM's config_manager opens /romm/config/config.yml on init and logs a
-# critical warning if missing. The file is optional (custom platform
-# definitions etc.) and an empty file is a valid YAML doc → defaults apply.
+# ── 2b. seed config.yml (RomM logs a critical "Config file not found!" otherwise) ──
+# RomM 5.3+ wants the library layout declared under `filesystem.structure`
+# (it refuses to start on an undeclared Structure B; Structure A is the
+# default but we declare it anyway). Our NFS tree is Structure A:
+#   library/roms/<platform>/<game> + library/bios/<platform>.
+# Seed when the file is missing OR empty (pre-5.3 installs seeded an empty
+# file). Never touch a non-empty file — RomM edits it from the UI.
 mkdir -p "$REPO_DIR/config"
-if [ ! -f "$REPO_DIR/config/config.yml" ]; then
-  echo "[2b/6] seeding empty $REPO_DIR/config/config.yml"
-  : > "$REPO_DIR/config/config.yml"
+if [ ! -s "$REPO_DIR/config/config.yml" ]; then
+  echo "[2b/6] seeding $REPO_DIR/config/config.yml (filesystem.structure, Structure A)"
+  cp "$REPO_DIR/config/config.yml.example" "$REPO_DIR/config/config.yml"
 else
-  echo "[2b/6] config/config.yml already present"
+  echo "[2b/6] config/config.yml already present (non-empty) — left as is"
 fi
 
 # ── 3. roms subtree sanity ───────────────────────────────────────────────

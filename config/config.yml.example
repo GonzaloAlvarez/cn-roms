@@ -1,0 +1,11 @@
+# RomM runtime config — seeded into ./config/config.yml by setup.sh (the live
+# file is gitignored; RomM edits it from its UI). Reference:
+# https://docs.romm.app/latest/configuration/config-yml/
+#
+# Library layout on raidnas NFS (Structure A — platform folder under roms/):
+#   /romm/library/roms/<platform>/<game>
+#   /romm/library/bios/<platform>/<firmware>
+filesystem:
+  structure:
+    default: "roms/{platform}/{game}"
+    firmware: "bios/{platform}"
