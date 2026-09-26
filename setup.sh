@@ -88,5 +88,4 @@ echo
 docker compose -p cn-roms ps
 
 echo
-echo "Done. First-boot: open https://roms.kaiser.lan (LAN) or"
-echo "      https://roms.lab.gn.al (tailnet) to complete the admin wizard."
+echo "Done. First-boot: open https://roms.lab.gn.al (canonical URL; LAN + tailnet)"

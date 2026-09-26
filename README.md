@@ -1,10 +1,15 @@
 # cn-roms
 
 [RomM](https://romm.app) — self-hosted ROM library manager — on `kaiser.lan`.
-Dual-ingress, like `cn-media`'s jellyfin.
+**One canonical URL**, reachable from both networks (same shape as `cn-librechat`):
 
-- **LAN URL**: `https://roms.kaiser.lan` (step-ca cert)
-- **Tailnet URL**: `https://roms.lab.gn.al` (Let's Encrypt wildcard via VPS traefik-lab)
+- **Canonical**: `https://roms.lab.gn.al` — tailnet: LE wildcard via VPS traefik-lab;
+  LAN: split-horizon DNS (Technitium `cn-dnsdhcpd/dns/records.tsv` + pfSense
+  `cn-home` `LAN_HOSTS`) → kaiser traefik-lan, step-ca leaf.
+- **Alias**: `https://roms.kaiser.lan` → **301** to the canonical URL (cn-home
+  `roms-canonical` middleware). It cannot be a second origin: RomM's OIDC
+  redirect URI is static, the OAuth state lives in a host-scoped cookie, and the
+  Argosy pairing QR is built from `window.location.origin`.
 - **On kaiser**: `/home/gonzalo/cn-roms/`
 - **Operated via systemd**: `sudo systemctl restart docker-compose@cn-roms.service` (not direct `docker compose`)
 
@@ -52,11 +57,15 @@ ssh hs.gn.al 'docker exec cloudnet-headscale-1 \
 
 ```sh
 ssh kaiser.lan 'cd ~ && git clone https://github.com/GonzaloAlvarez/cn-roms.git'
-ssh kaiser.lan 'cd ~/cn-roms && cp .env.example .env'
-# edit ~/cn-roms/.env: fill ROMS_AUTHKEY, ROMM_SECRET, DB_PASSWORD, DB_ROOT_PASSWORD
+ssh kaiser.lan 'cd ~/cn-roms && kauket get kaiser.cn_roms_env'   # installs .env (0600)
 ```
 
-`ROMM_SECRET` should be a 64-char hex string: `openssl rand -hex 32`.
+`.env` is **Kauket-managed** (`kaiser.cn_roms_env`; keys documented in
+`.env.example`). To change a value: edit a copy on the Mac, `kauket add
+kaiser.cn_roms_env <file> --dest /home/gonzalo/cn-roms/.env --mode 0600 --force`,
+then `kauket get` on kaiser and force-recreate `romm`. `ROMM_SECRET` is a
+64-char hex string (`openssl rand -hex 32`) — never rotate it casually, it
+invalidates every session and Client API Token pairing in flight.
 
 ### 4. Run setup
 
@@ -81,56 +90,76 @@ systemd unit, starts the service.
 ### 6. First-boot admin wizard
 
 RomM doesn't accept admin credentials via env vars — the first user is created
-through a web wizard. Open `https://roms.kaiser.lan/` (LAN) or
-`https://roms.lab.gn.al/` (tailnet) and complete the setup. The first account
-is automatically admin.
+through a web wizard. Open `https://roms.lab.gn.al/` and complete the setup.
+The first account is automatically admin — it is also the **break-glass local
+admin** once OIDC is on (see §6b); give it the same email as your Authentik
+user so the first OIDC login links to it instead of creating a duplicate.
 
-### 6b. Authentik SSO via Traefik forward-auth
+### 6b. Authentik SSO via native OIDC
 
-Both ingresses are gated by Authentik via Traefik's `forwardAuth` middleware
-(`authentik-lan` on cn-home, `authentik-lab` on cn-root-docker tailnet). RomM
-itself has **no OIDC integration** — Authentik's embedded outpost injects an
-`Authorization: Basic <b64(user:pass)>` header on every authenticated request,
-which RomM's `HybridAuthBackend` validates against its own user DB
-(`/backend/handler/auth/hybrid_auth.py:30-46`).
-
-Trade-off the operator has explicitly accepted: every Authentik user who's
-in the `media` or `infra-admins` group lands in RomM as the **same** shared
-user. RomM's user model becomes vestigial — one bootstrap admin is enough.
-
-To wire it up:
+RomM speaks OIDC natively (since 3.7). The Authentik side is provisioned by
+`cn-authentik/setup-roms-oidc.sh` (idempotent — provider + application `roms`,
+ONE strict redirect `https://roms.lab.gn.al/api/oauth/openid`, custom scope
+mappings `roms-email` / `roms-groups`, bindings for `media` + `infra-admins`):
 
 ```sh
-# On neptune.lan (Authentik host):
-cd ~/cn-authentik
-ROMM_SSO_USERNAME=<your romm user> \
-ROMM_SSO_PASSWORD=<your romm password> \
-  ./setup-romm-proxy-sso.sh
+ssh neptune.lan 'cd ~/cn-authentik && ./setup-roms-oidc.sh'   # prints OIDC_CLIENT_ID/SECRET
+# on the Mac: add them to the Kauket env (kaiser.cn_roms_env), then on kaiser:
+kauket get kaiser.cn_roms_env && docker compose -p cn-roms up -d --force-recreate --no-deps romm
 ```
 
-This creates two Authentik proxy providers (`roms-lan` with
-`external_host=https://roms.kaiser.lan`, `roms-lab` with `https://roms.lab.gn.al`),
-two applications, four group→app bindings, and writes `romm_username` +
-`romm_password` to the `media` and `infra-admins` group attributes. Re-run
-any time to rotate credentials (PATCH-merge, idempotent).
+RomM-side settings live in `docker-compose.yml` (`ROMM_BASE_URL`, `OIDC_*`);
+only the client id/secret come from `.env`. Roles come from the Authentik
+`groups` claim on **every** login: `infra-admins` → ADMIN, `media` → USER
+(`OIDC_ROLE_VIEWER`; RomM 5.x has only those two roles — USER's permission
+group covers saves/states/devices, which is what Argosy needs). Anyone
+outside those groups is refused by Authentik before reaching RomM. New
+people: `cn-authentik/setup-user.sh --groups media`; their RomM account is
+auto-created on first login (`OIDC_ALLOW_REGISTRATION=true`).
 
-**Rollback**: comment the `- authentik-lan` line on the `roms` router in
-`cn-home/traefik-lan/dynamic.yml.tmpl`, drop the `middlewares=authentik-lab@file`
-tag from cn-roms's `consul-register` block, force-recreate traefik-lan and
-consul-register. RomM falls back to its native login page; the bootstrap
-admin still works.
+**Account linking is by email.** An existing local user with the same email
+as the Authentik identity is linked; otherwise RomM creates a second account.
 
-### 7. Argosy on Android
+**Why not the Traefik forward-auth gate any more:** Authentik's proxy provider
+(`forward_single` + Basic injection) intercepted every non-browser request,
+so Argosy's `Authorization: Bearer rmm_…` calls got an Authentik HTML page
+instead of JSON, and every person landed as the same shared RomM user. With
+native OIDC Authentik only sees browsers; RomM validates Client API Tokens
+itself and each person has their own saves and devices.
+
+**Break-glass / rollback** (all via the Kauket env + `up -d --force-recreate
+--no-deps romm`):
+
+| Situation | Do |
+|---|---|
+| OIDC broken, need in | `OIDC_ENABLED=false` → login page shows local user/password only |
+| Locked out with `DISABLE_USERPASS_LOGIN=true` | set it to `false`, recreate `romm`, log in as the local admin `gonzalo` |
+| Back to forward-auth entirely | not supported any more — `setup-romm-proxy-sso.sh` was retired; see git history |
+
+### 7. Argosy on Android (phones, handhelds, TV boxes)
+
+Argosy authenticates with a per-user **RomM Client API Token**, paired by
+device-managed registration (RomM ≥ 5.0). Authentik is not involved.
 
 1. Install Tailscale from Google Play; sign in via the headscale flow
-   (`https://hs.gn.al/login`).
-2. In a desktop browser, open RomM → Profile → **Pair device** → QR code.
-3. Install Argosy from
+   (`https://hs.gn.al/login`). **Keep it on** — `roms.lab.gn.al` must
+   resolve to the tailnet ingress (LE cert). On home Wi-Fi *without*
+   Tailscale the name resolves to kaiser's **step-ca** leaf, which stock
+   Android rejects (RomM is not on a public CA on the LAN side — a
+   Cloudflare DNS-01 resolver on traefik-lan would lift that; deliberately
+   not done).
+2. Install Argosy from
    [github.com/rommapp/argosy-launcher/releases](https://github.com/rommapp/argosy-launcher/releases)
-   (no Play Store / F-Droid distribution; consider Obtainium).
-4. Open Argosy, scan the QR. Argosy stores the token and talks to
-   `https://roms.lab.gn.al` from then on. (Don't try `roms.kaiser.lan` — stock
-   Android doesn't trust step-ca.)
+   (no Play Store / F-Droid; consider Obtainium).
+3. In Argosy: Settings → RomM → server `https://roms.lab.gn.al`. It shows a QR
+   code / short code.
+4. In a browser signed in to RomM **as the person who owns the device**
+   (via "Login with Authentik" at `https://roms.lab.gn.al`), approve the
+   device. Argosy stores the token and syncs library, saves and states.
+5. Tokens are per user per device: review/revoke under Settings → Client API
+   Tokens (up to 25 per user; revoke all before disabling a user).
+
+Pair only from the canonical URL — the QR encodes the page origin.
 
 ## Operations
 

@@ -115,6 +115,35 @@ services:
       - RETROACHIEVEMENTS_API_KEY=${RETROACHIEVEMENTS_API_KEY:-}
       - STEAMGRIDDB_API_KEY=${STEAMGRIDDB_API_KEY:-}
       - TZ=${TIMEZONE}
+      # ── Canonical URL + native Authentik OIDC (README §6b) ──
+      # ONE origin: OIDC_REDIRECT_URI is static, the OAuth state lives in a
+      # host-scoped cookie and the Argosy pairing QR is built from
+      # window.location.origin — so roms.kaiser.lan 301s here (cn-home).
+      # Argosy/companion apps never touch Authentik: they send RomM Client
+      # API Tokens (Authorization: Bearer rmm_…) that RomM validates itself.
+      - ROMM_BASE_URL=https://roms.${LAB_DOMAIN}
+      - ROMM_SESSION_SECURE_COOKIE=true
+      - OIDC_ENABLED=${OIDC_ENABLED:-true}
+      - OIDC_PROVIDER=authentik
+      - OIDC_CLIENT_ID=${OIDC_CLIENT_ID}
+      - OIDC_CLIENT_SECRET=${OIDC_CLIENT_SECRET}
+      - OIDC_REDIRECT_URI=https://roms.${LAB_DOMAIN}/api/oauth/openid
+      # Per-application URL (RomM appends /.well-known/openid-configuration).
+      # Reached over the tailnet → VPS traefik-lab (LE cert, system-trusted),
+      # same path cn-librechat uses — no CA bundle needed.
+      - OIDC_SERVER_APPLICATION_URL=https://auth.${LAB_DOMAIN}/application/o/roms
+      - OIDC_ALLOW_REGISTRATION=true
+      - OIDC_AUTOLOGIN=false
+      # Authentik `groups` claim → RomM role (re-evaluated on every login).
+      # RomM 5.x has two roles: ADMIN and USER (OIDC_ROLE_VIEWER grants USER,
+      # whose permission group covers saves/states/devices for Argosy).
+      - OIDC_CLAIM_ROLES=groups
+      - OIDC_ROLE_ADMIN=infra-admins
+      - OIDC_ROLE_VIEWER=media
+      # Flip to true (Kauket env) once OIDC admin login is proven. Recovery:
+      # set false, `up -d --force-recreate --no-deps romm`, log in as the
+      # local admin.
+      - DISABLE_USERPASS_LOGIN=${DISABLE_USERPASS_LOGIN:-false}
     volumes:
       - /home/gonzalo/docker/data/nfs/roms/library:/romm/library
       - /home/gonzalo/docker/data/nfs/roms/assets:/romm/assets
@@ -135,6 +164,10 @@ services:
     restart: unless-stopped
 
   # ── Consul self-registration: makes roms.lab.gn.al routable via traefik-lab ──
+  # No forward-auth middleware on this router any more: RomM authenticates
+  # browsers itself (native Authentik OIDC) and companion apps by Client API
+  # Token. The authentik-lab@file middleware still exists on traefik-lab for
+  # cn-books / cn-sms-service.
   consul-register:
     image: curlimages/curl:8.8.0
     network_mode: "service:ts-roms"
@@ -160,8 +193,7 @@ services:
             "traefik.http.routers.$$NAME.rule=Host(\`$$SUB.$$LAB_DOMAIN\`)",
             "traefik.http.routers.$$NAME.entrypoints=websecure",
             "traefik.http.routers.$$NAME.tls=true",
-            "traefik.http.routers.$$NAME.tls.certresolver=dns",
-            "traefik.http.routers.$$NAME.middlewares=authentik-lab@file"
+            "traefik.http.routers.$$NAME.tls.certresolver=dns"
           ],
           "Check": {
             "TCP": "$$TAILNET_HOST:$$PORT",
